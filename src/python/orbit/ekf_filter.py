@@ -1,9 +1,16 @@
 import numpy as np
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
+import gc
 
 from .orbital_elements import OrbitalElements, rv_to_orbital_elements, orbital_elements_to_rv
 from .orbit_propagator import OrbitPropagator
+
+try:
+    from telemetry_core import ExtendedKalmanFilterCore
+    HAS_CPP_EKF = True
+except ImportError:
+    HAS_CPP_EKF = False
 
 
 @dataclass
@@ -25,10 +32,12 @@ class ExtendedKalmanFilter:
     def __init__(self, propagator: OrbitPropagator,
                  process_noise: Optional[np.ndarray] = None,
                  initial_state: Optional[np.ndarray] = None,
-                 initial_covariance: Optional[np.ndarray] = None):
+                 initial_covariance: Optional[np.ndarray] = None,
+                 use_cpp_acceleration: bool = True):
         self.propagator = propagator
         self.state_dim = 6
         self.measurement_dim = 3
+        self.use_cpp = use_cpp_acceleration and HAS_CPP_EKF
 
         if process_noise is None:
             self.Q = np.eye(self.state_dim) * 1e-6
@@ -50,6 +59,26 @@ class ExtendedKalmanFilter:
 
         self.R_default = np.eye(self.measurement_dim) * 1e3
 
+        if self.use_cpp:
+            self._cpp_core = ExtendedKalmanFilterCore()
+            self._sync_cpp_state()
+
+    def _sync_cpp_state(self):
+        if self.use_cpp:
+            self._cpp_core.set_process_noise(np.ascontiguousarray(self.Q, dtype=np.float64))
+            self._cpp_core.set_state(
+                np.ascontiguousarray(self.state.x, dtype=np.float64),
+                np.ascontiguousarray(self.state.P, dtype=np.float64),
+                self.state.timestamp
+            )
+
+    def _read_cpp_state(self):
+        if self.use_cpp:
+            x = self._cpp_core.get_state_vector()
+            P = self._cpp_core.get_covariance_matrix()
+            ts = self._cpp_core.get_timestamp()
+            self.state = EKFState(x=x, P=P, timestamp=ts)
+
     def initialize_from_elements(self, elements: OrbitalElements,
                                   position_uncertainty: float = 100.0,
                                   velocity_uncertainty: float = 1.0,
@@ -63,6 +92,9 @@ class ExtendedKalmanFilter:
         self.state.P = P
         self.state.timestamp = timestamp
 
+        if self.use_cpp:
+            self._sync_cpp_state()
+
     def initialize_from_rv(self, r: np.ndarray, v: np.ndarray,
                             position_uncertainty: float = 100.0,
                             velocity_uncertainty: float = 1.0,
@@ -75,6 +107,9 @@ class ExtendedKalmanFilter:
         self.state.P = P
         self.state.timestamp = timestamp
 
+        if self.use_cpp:
+            self._sync_cpp_state()
+
     def predict(self, dt: float, timestamp: float) -> EKFState:
         if dt <= 0:
             return self.state
@@ -83,17 +118,23 @@ class ExtendedKalmanFilter:
         v = self.state.velocity
 
         r_new, v_new = self.propagator.step(r, v, dt)
-
-        F = self.propagator.get_state_transition_matrix(r, v, dt)
-
         x_new = np.concatenate([r_new, v_new])
-        P_new = F @ self.state.P @ F.T + self.Q
 
-        self.state = EKFState(
-            x=x_new,
-            P=P_new,
-            timestamp=timestamp
-        )
+        if self.use_cpp:
+            F = self.propagator.get_state_transition_matrix(r, v, dt)
+            F_contig = np.ascontiguousarray(F, dtype=np.float64)
+            x_new_contig = np.ascontiguousarray(x_new, dtype=np.float64)
+            self._cpp_core.predict_state(x_new_contig, F_contig, dt, timestamp)
+            self._read_cpp_state()
+        else:
+            F = self.propagator.get_state_transition_matrix(r, v, dt)
+            P_new = F @ self.state.P @ F.T + self.Q
+
+            self.state = EKFState(
+                x=x_new,
+                P=P_new,
+                timestamp=timestamp
+            )
 
         return self.state
 
@@ -120,6 +161,25 @@ class ExtendedKalmanFilter:
             dt = timestamp - self.state.timestamp
             self.predict(dt, timestamp)
 
+        if self.use_cpp and z.shape[0] == self.measurement_dim:
+            h_x = self.h_function(self.state.x)
+            y = z - h_x
+
+            z_contig = np.ascontiguousarray(z, dtype=np.float64)
+            R_contig = np.ascontiguousarray(R, dtype=np.float64)
+            success = self._cpp_core.update_position(z_contig, R_contig)
+            if success:
+                self._read_cpp_state()
+            else:
+                self._update_python(z, R, timestamp)
+        else:
+            self._update_python(z, R, timestamp)
+
+        y = z - self.h_function(self.state.x)
+        return self.state, y
+
+    def _update_python(self, z: np.ndarray, R: np.ndarray,
+                       timestamp: Optional[float] = None):
         H = self.H_jacobian(self.state.x)
         h_x = self.h_function(self.state.x)
 
@@ -138,8 +198,6 @@ class ExtendedKalmanFilter:
             self.state = EKFState(x=x_new, P=P_new, timestamp=timestamp)
         else:
             self.state = EKFState(x=x_new, P=P_new, timestamp=self.state.timestamp)
-
-        return self.state, y
 
     def process_measurement(self, measurement: np.ndarray,
                             measurement_timestamp: float,

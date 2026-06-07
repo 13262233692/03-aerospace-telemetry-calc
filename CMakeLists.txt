@@ -22,12 +22,16 @@ set(TELEMETRY_HEADERS
     include/reed_solomon.h
     include/telemetry_parser.h
     include/shared_memory.h
+    include/matrix_math.h
+    include/ekf_core.h
 )
 
 pybind11_add_module(telemetry_core
     src/cpp/pybind_wrapper.cpp
     ${TELEMETRY_SOURCES}
 )
+
+target_compile_definitions(telemetry_core PRIVATE BUILD_PYTHON_BINDINGS)
 
 target_include_directories(telemetry_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

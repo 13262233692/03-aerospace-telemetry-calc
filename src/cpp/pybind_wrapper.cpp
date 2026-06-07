@@ -1,17 +1,124 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <pybind11/buffer_info.h>
+
+#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+#include <numpy/arrayobject.h>
 
 #include "ccsds_frame_sync.h"
 #include "reed_solomon.h"
 #include "telemetry_parser.h"
 #include "shared_memory.h"
+#include "ekf_core.h"
 
 namespace py = pybind11;
 using namespace aerospace;
 
+namespace {
+
+template<typename T>
+py::array_t<T> make_zero_copy_array(T* data, std::vector<ssize_t> shape,
+                                     std::function<void(T*)> deleter = nullptr) {
+    py::capsule free_when_done(data, [deleter, data](void* ptr) {
+        if (deleter) {
+            deleter(static_cast<T*>(ptr));
+        }
+    });
+
+    return py::array_t<T>(shape, {}, data, free_when_done);
+}
+
+py::array_t<double> vector6_to_numpy(const Vector6& vec) {
+    auto* data = new double[STATE_DIM];
+    std::memcpy(data, vec.data(), sizeof(double) * STATE_DIM);
+
+    return make_zero_copy_array<double>(data, {STATE_DIM},
+        [](double* p) { delete[] p; });
+}
+
+py::array_t<double> matrix6x6_to_numpy(const Matrix6x6& mat) {
+    auto* data = new double[STATE_DIM * STATE_DIM];
+    for (int i = 0; i < STATE_DIM; ++i) {
+        std::memcpy(data + i * STATE_DIM, mat[i].data(), sizeof(double) * STATE_DIM);
+    }
+
+    return make_zero_copy_array<double>(data, {STATE_DIM, STATE_DIM},
+        [](double* p) { delete[] p; });
+}
+
+void numpy_to_vector6(const py::array_t<double>& arr, Vector6& vec) {
+    if (arr.ndim() != 1 || arr.shape(0) != STATE_DIM) {
+        throw std::runtime_error("Expected 1D array of size 6");
+    }
+
+    auto buf = arr.request();
+    if (buf.strides[0] == sizeof(double)) {
+        std::memcpy(vec.data(), buf.ptr, sizeof(double) * STATE_DIM);
+    } else {
+        auto ptr = static_cast<double*>(buf.ptr);
+        for (int i = 0; i < STATE_DIM; ++i) {
+            vec[i] = ptr[i * (buf.strides[0] / sizeof(double))];
+        }
+    }
+}
+
+void numpy_to_matrix6x6(const py::array_t<double>& arr, Matrix6x6& mat) {
+    if (arr.ndim() != 2 || arr.shape(0) != STATE_DIM || arr.shape(1) != STATE_DIM) {
+        throw std::runtime_error("Expected 2D array of size 6x6");
+    }
+
+    auto buf = arr.request();
+    auto ptr = static_cast<double*>(buf.ptr);
+    ssize_t stride0 = buf.strides[0] / sizeof(double);
+    ssize_t stride1 = buf.strides[1] / sizeof(double);
+
+    for (int i = 0; i < STATE_DIM; ++i) {
+        for (int j = 0; j < STATE_DIM; ++j) {
+            mat[i][j] = ptr[i * stride0 + j * stride1];
+        }
+    }
+}
+
+void numpy_to_vector3(const py::array_t<double>& arr, Vector3& vec) {
+    if (arr.ndim() != 1 || arr.shape(0) != MEAS_DIM) {
+        throw std::runtime_error("Expected 1D array of size 3");
+    }
+
+    auto buf = arr.request();
+    if (buf.strides[0] == sizeof(double)) {
+        std::memcpy(vec.data(), buf.ptr, sizeof(double) * MEAS_DIM);
+    } else {
+        auto ptr = static_cast<double*>(buf.ptr);
+        for (int i = 0; i < MEAS_DIM; ++i) {
+            vec[i] = ptr[i * (buf.strides[0] / sizeof(double))];
+        }
+    }
+}
+
+void numpy_to_matrix3x3(const py::array_t<double>& arr, Matrix3x3& mat) {
+    if (arr.ndim() != 2 || arr.shape(0) != MEAS_DIM || arr.shape(1) != MEAS_DIM) {
+        throw std::runtime_error("Expected 2D array of size 3x3");
+    }
+
+    auto buf = arr.request();
+    auto ptr = static_cast<double*>(buf.ptr);
+    ssize_t stride0 = buf.strides[0] / sizeof(double);
+    ssize_t stride1 = buf.strides[1] / sizeof(double);
+
+    for (int i = 0; i < MEAS_DIM; ++i) {
+        for (int j = 0; j < MEAS_DIM; ++j) {
+            mat[i][j] = ptr[i * stride0 + j * stride1];
+        }
+    }
+}
+
+}
+
 PYBIND11_MODULE(telemetry_core, m) {
     m.doc() = "Aerospace Telemetry C++ Core Module";
+
+    import_array();
 
     py::class_<CCSDSFrameSync>(m, "CCSDSFrameSync")
         .def(py::init<>())
@@ -135,4 +242,54 @@ PYBIND11_MODULE(telemetry_core, m) {
         .def_property_readonly("is_empty", &LockFreeRingBuffer::is_empty)
         .def_property_readonly("is_full", &LockFreeRingBuffer::is_full)
         .def_readonly_static("DEFAULT_RING_SIZE", &LockFreeRingBuffer::DEFAULT_RING_SIZE);
+
+    py::class_<ExtendedKalmanFilterCore, std::shared_ptr<ExtendedKalmanFilterCore>>(m, "ExtendedKalmanFilterCore")
+        .def(py::init<>())
+        .def("reset", &ExtendedKalmanFilterCore::reset)
+        .def("set_process_noise", [](ExtendedKalmanFilterCore& self, py::array_t<double> Q_np) {
+            Matrix6x6 Q;
+            numpy_to_matrix6x6(Q_np, Q);
+            self.set_process_noise(Q);
+        }, py::arg("Q").noconvert())
+        .def("set_state", [](ExtendedKalmanFilterCore& self, py::array_t<double> x_np,
+                             py::array_t<double> P_np, double timestamp) {
+            Vector6 x;
+            Matrix6x6 P;
+            numpy_to_vector6(x_np, x);
+            numpy_to_matrix6x6(P_np, P);
+            self.set_state(x, P, timestamp);
+        }, py::arg("x").noconvert(), py::arg("P").noconvert(), py::arg("timestamp"))
+        .def("predict", [](ExtendedKalmanFilterCore& self, py::array_t<double> F_np,
+                           double dt, double timestamp) {
+            Matrix6x6 F;
+            numpy_to_matrix6x6(F_np, F);
+            self.predict(F, dt, timestamp);
+        }, py::arg("F").noconvert(), py::arg("dt"), py::arg("timestamp"))
+        .def("predict_state", [](ExtendedKalmanFilterCore& self, py::array_t<double> x_new_np,
+                                 py::array_t<double> F_np, double dt, double timestamp) {
+            Vector6 x_new;
+            Matrix6x6 F;
+            numpy_to_vector6(x_new_np, x_new);
+            numpy_to_matrix6x6(F_np, F);
+            self.predict_state(x_new, F, dt, timestamp);
+        }, py::arg("x_new").noconvert(), py::arg("F").noconvert(),
+           py::arg("dt"), py::arg("timestamp"))
+        .def("update_position", [](ExtendedKalmanFilterCore& self,
+                                   py::array_t<double> measurement_np,
+                                   py::array_t<double> R_np) {
+            Vector3 measurement;
+            Matrix3x3 R;
+            numpy_to_vector3(measurement_np, measurement);
+            numpy_to_matrix3x3(R_np, R);
+            return self.update_position(measurement, R);
+        }, py::arg("measurement").noconvert(), py::arg("R").noconvert())
+        .def("get_state_vector", [](const ExtendedKalmanFilterCore& self) {
+            return vector6_to_numpy(self.get_state().x);
+        })
+        .def("get_covariance_matrix", [](const ExtendedKalmanFilterCore& self) {
+            return matrix6x6_to_numpy(self.get_state().P);
+        })
+        .def("get_timestamp", &ExtendedKalmanFilterCore::get_timestamp)
+        .def_readonly_static("STATE_DIM", &STATE_DIM)
+        .def_readonly_static("MEAS_DIM", &MEAS_DIM);
 }
